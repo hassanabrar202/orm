@@ -368,4 +368,90 @@ describe('integration/nested-mutations', () => {
     },
     timeouts.spinUpPpgDev,
   );
+
+  it(
+    'update() applies an array of operations on a to-many relation in array order',
+    async () => {
+      await withCollectionRuntime(async (runtime) => {
+        const users = createReturningUsersCollection(runtime);
+
+        await seedUsers(runtime, [{ id: 1, name: 'Alice', email: 'alice@example.com' }]);
+        await seedPosts(runtime, [
+          { id: 10, title: 'Old first', userId: 1, views: 10 },
+          { id: 11, title: 'Old second', userId: 1, views: 11 },
+          { id: 12, title: 'Unowned', userId: null, views: 12 },
+        ]);
+
+        const updated = await users
+          .where({ id: 1 })
+          .select('id', 'name')
+          .include('posts', (posts) =>
+            posts.select('id', 'title', 'userId').orderBy((post) => post.id.asc()),
+          )
+          .update({
+            posts: (posts) => [
+              posts.disconnect(),
+              posts.create({ id: 30, title: 'Created', views: 30 }),
+              posts.connect({ id: 12 }),
+            ],
+          });
+
+        expect(updated).toEqual({
+          id: 1,
+          name: 'Alice',
+          posts: [
+            { id: 12, title: 'Unowned', userId: 1 },
+            { id: 30, title: 'Created', userId: 1 },
+          ],
+        });
+
+        const rows = await runtime.query<{ id: number; user_id: number | null }>(
+          'select id, user_id from posts order by id',
+        );
+        expect(rows).toEqual([
+          { id: 10, user_id: null },
+          { id: 11, user_id: null },
+          { id: 12, user_id: 1 },
+          { id: 30, user_id: 1 },
+        ]);
+      });
+    },
+    timeouts.spinUpPpgDev,
+  );
+
+  it(
+    'create() applies an array of operations on a to-many relation',
+    async () => {
+      await withCollectionRuntime(async (runtime) => {
+        const users = createReturningUsersCollection(runtime);
+
+        await seedPosts(runtime, [{ id: 12, title: 'Unowned', userId: null, views: 12 }]);
+
+        const created = await users
+          .select('id', 'name')
+          .include('posts', (posts) =>
+            posts.select('id', 'title', 'userId').orderBy((post) => post.id.asc()),
+          )
+          .create({
+            id: 1,
+            name: 'Alice',
+            email: 'alice@example.com',
+            posts: (posts) => [
+              posts.create({ id: 30, title: 'Created', views: 30 }),
+              posts.connect({ id: 12 }),
+            ],
+          });
+
+        expect(created).toEqual({
+          id: 1,
+          name: 'Alice',
+          posts: [
+            { id: 12, title: 'Unowned', userId: 1 },
+            { id: 30, title: 'Created', userId: 1 },
+          ],
+        });
+      });
+    },
+    timeouts.spinUpPpgDev,
+  );
 });

@@ -288,4 +288,52 @@ describe('integration/nested-mutations on SQLite: update()', () => {
     },
     timeouts.databaseOperation,
   );
+
+  it(
+    'applies an array of operations on a to-many relation in array order',
+    async () => {
+      await withDatabase(async ({ users, posts, rows }) => {
+        await users.create({
+          id: 1,
+          name: 'Alice',
+          posts: (children) =>
+            children.create([
+              { id: 10, title: 'Old first' },
+              { id: 11, title: 'Old second' },
+            ]),
+        });
+        await posts.create({ id: 12, title: 'Unowned' });
+
+        const updated = await users
+          .where({ id: 1 })
+          .select('id', 'name')
+          .include('posts', (children) =>
+            children.select('id', 'title', 'userId').orderBy((post) => post['id']!.asc()),
+          )
+          .update({
+            posts: (children) => [
+              children.disconnect(),
+              children.create({ id: 30, title: 'Created' }),
+              children.connect({ id: 12 }),
+            ],
+          });
+
+        expect(updated).toEqual({
+          id: 1,
+          name: 'Alice',
+          posts: [
+            { id: 12, title: 'Unowned', userId: 1 },
+            { id: 30, title: 'Created', userId: 1 },
+          ],
+        });
+        expect(rows('select id, user_id from posts order by id')).toEqual([
+          { id: 10, user_id: null },
+          { id: 11, user_id: null },
+          { id: 12, user_id: 1 },
+          { id: 30, user_id: 1 },
+        ]);
+      });
+    },
+    timeouts.databaseOperation,
+  );
 });

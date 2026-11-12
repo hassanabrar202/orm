@@ -70,6 +70,23 @@ export function parseMutationInput(
       modelName,
       value(createRelationMutator<Contract<SqlStorage>, string>()),
     );
+    if (
+      mutations.length > 1 &&
+      (relation.cardinality === 'N:1' || relation.cardinality === '1:1')
+    ) {
+      throw ormError(
+        'ORM.RELATION_MUTATION_UNSUPPORTED',
+        `Relation "${fieldName}" on model "${modelName}" is a to-one relation and takes one operation, not ${mutations.length}`,
+        {
+          meta: {
+            relation: fieldName,
+            model: modelName,
+            reason: 'to-one-relation',
+            operations: mutations.length,
+          },
+        },
+      );
+    }
     if (mutations.length > 0) {
       relationMutations.push({ name: fieldName, relation, mutations });
     }

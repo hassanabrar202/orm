@@ -115,20 +115,14 @@ export function addBeforeWrite(
   const keys: KeySource[] = [];
   const nullColumns: Record<string, null> = {};
   for (const relationMutation of parentOwned) {
-    const columns = localColumnsOf(t.context.contract, model, relationMutation.relation);
-    let last: KeySource | undefined;
     for (const mutation of relationMutation.mutations) {
-      last =
-        mutation.kind === 'disconnect'
-          ? undefined
-          : addParentOwned(t, model, relationMutation, mutation);
-    }
-    if (last === undefined) {
-      for (const column of columns) {
-        nullColumns[column] = null;
+      if (mutation.kind === 'disconnect') {
+        for (const column of localColumnsOf(t.context.contract, model, relationMutation.relation)) {
+          nullColumns[column] = null;
+        }
+      } else {
+        keys.push(addParentOwned(t, model, relationMutation, mutation));
       }
-    } else {
-      keys.push(last);
     }
   }
   return { keys, nullColumns };

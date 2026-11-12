@@ -99,23 +99,39 @@ describe('a relation callback that returns an array of operations', () => {
     );
   });
 
-  it('on a relation the parent holds the key for runs every operation, and the last one sets the key', () => {
+  it('takes a one-element array on a relation the parent holds the key for as the operation', () => {
     expect(
-      printCreate('Post', {
-        ...hello,
-        author: (author: Mutator) => [author.connect({ id: 1 }), author.connect({ id: 2 })],
-      }),
+      printCreate('Post', { ...hello, author: (author: Mutator) => [author.connect({ id: 1 })] }),
     ).toBe(
-      [
-        'n1 Find users where id = 1 limit 1',
-        'n2 Assert <- Rows n1',
-        'n3 Find users where id = 2 limit 1',
-        'n4 Assert <- Rows n3',
-        'n5 Insert posts <- PayloadData n3 (id->user_id)',
-        'result: n5',
-      ].join('\n'),
+      printCreate('Post', { ...hello, author: (author: Mutator) => author.connect({ id: 1 }) }),
     );
   });
+
+  it.each([
+    ['update()', 'Post', 'author', printUpdate, {}],
+    ['create()', 'Post', 'author', printCreate, hello],
+    ['update()', 'User', 'profile', printUpdate, {}],
+    ['create()', 'User', 'profile', printCreate, ada],
+  ] as const)(
+    'rejects in %s an array of two operations on the to-one relation %s.%s',
+    (_, modelName, relation, print, scalars) => {
+      expect(() =>
+        print(modelName, {
+          ...scalars,
+          [relation]: (mutator: Mutator) => [
+            mutator.connect({ id: 1 }),
+            mutator.connect({ id: 2 }),
+          ],
+        }),
+      ).toThrow(
+        expect.objectContaining({
+          code: 'ORM.RELATION_MUTATION_UNSUPPORTED',
+          message: `Relation "${relation}" on model "${modelName}" is a to-one relation and takes one operation, not 2`,
+          meta: { relation, model: modelName, reason: 'to-one-relation', operations: 2 },
+        }),
+      );
+    },
+  );
 
   it('adds nothing for an empty array', () => {
     expect({

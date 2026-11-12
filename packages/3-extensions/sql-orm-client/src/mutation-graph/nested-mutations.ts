@@ -1,5 +1,6 @@
 import type { Contract } from '@internal/contract/types';
 import type { SqlStorage } from '@internal/sql-contract/types';
+import type { AnyExpression } from '@internal/sql-relational-core/ast';
 import type { ExecutionContext } from '@internal/sql-relational-core/query-lane-context';
 import { blindCast, castAs } from '@internal/utils/casts';
 import {
@@ -8,8 +9,10 @@ import {
   resolveModelTableName,
   resolveRelationTargetColumns,
 } from '../collection-contract';
-import { createStatementTables } from '../collection-tables';
-import { shorthandToWhereExpr } from '../filters';
+import { mapModelDataToStorageRow } from '../collection-runtime';
+import { createStatementTables, tableAliases } from '../collection-tables';
+import { shorthandToWhereExpr, whereArgOf } from '../filters';
+import { createModelAccessor, createModelCallbackTools } from '../model-accessor';
 import { type InsertConflictSkip, projectTableColumn } from '../mutation-statements';
 import { ormError } from '../orm-errors';
 import {
@@ -24,8 +27,15 @@ import {
 } from '../relation-mutations';
 import { storageTableForContract } from '../storage-resolution';
 import type { AliasedTable } from '../table-scope';
-import type { MutationCreateInput, MutationUpdateInput, RelationMutation } from '../types';
+import type {
+  MutationCreateInput,
+  MutationUpdateInput,
+  RelationMutation,
+  RelationMutationFilter,
+} from '../types';
 import { emptyState } from '../types';
+import { isWhereDirectInput, normalizeWhereArg } from '../where-interop';
+import { combineWhereExprs } from '../where-utils';
 import { Assert } from './assert';
 import type { ColumnMapping, NodeId } from './edge';
 import {
@@ -47,7 +57,8 @@ import { Rows } from './rows';
 import { createRowOf, withCreateDefaults } from './storage-rows';
 
 type Mutation = RelationMutation<Contract<SqlStorage>, string>;
-type CreateOrConnect = Exclude<Mutation, { kind: 'disconnect' }>;
+type CreateOrConnect = Extract<Mutation, { kind: 'create' | 'connect' }>;
+type FilteredWrite = Extract<Mutation, { kind: 'updateAll' | 'deleteAll' }>;
 
 export interface Translation extends Builder {
   readonly parentRow: NodeId | undefined;
@@ -72,7 +83,7 @@ export function addCreateWithRelations(
   { keysFromParent, returns, shape, variantValue }: CreateOf,
 ): NodeId {
   for (const relationMutation of parsed.relationMutations) {
-    rejectDisconnect(relationMutation);
+    rejectUpdateOnly(relationMutation);
   }
   const before = addBeforeWrite(t, model, parsed.relationMutations);
   const row = createRowOf(t.context, model, variantValue, parsed.scalarData, undefined);
@@ -116,6 +127,9 @@ export function addBeforeWrite(
   const nullColumns: Record<string, null> = {};
   for (const relationMutation of parentOwned) {
     for (const mutation of relationMutation.mutations) {
+      if (isFilteredWrite(mutation)) {
+        throw toOneRelation(relationMutation.name, mutation.kind);
+      }
       if (mutation.kind === 'disconnect') {
         for (const column of localColumnsOf(t.context.contract, model, relationMutation.relation)) {
           nullColumns[column] = null;
@@ -147,14 +161,28 @@ export function addAfterWrite(
   }
 }
 
-function rejectDisconnect({ name, mutations }: ParsedRelationMutation): void {
-  if (mutations.some(({ kind }) => kind === 'disconnect')) {
-    throw ormError(
-      'ORM.RELATION_MUTATION_UNSUPPORTED',
-      'disconnect() is only supported in update() nested mutations',
-      { meta: { kind: 'disconnect', relation: name } },
-    );
+function rejectUpdateOnly({ name, mutations }: ParsedRelationMutation): void {
+  for (const { kind } of mutations) {
+    if (kind === 'disconnect' || kind === 'updateAll' || kind === 'deleteAll') {
+      throw ormError(
+        'ORM.RELATION_MUTATION_UNSUPPORTED',
+        `${kind}() is only supported in update() nested mutations`,
+        { meta: { kind, relation: name } },
+      );
+    }
   }
+}
+
+function isFilteredWrite(mutation: Mutation): mutation is FilteredWrite {
+  return mutation.kind === 'updateAll' || mutation.kind === 'deleteAll';
+}
+
+function toOneRelation(name: string, kind: FilteredWrite['kind']) {
+  return ormError(
+    'ORM.RELATION_MUTATION_UNSUPPORTED',
+    `${kind}() nested mutation for relation "${name}" is only supported on to-many relations`,
+    { meta: { kind, relation: name, reason: 'to-one-relation' } },
+  );
 }
 
 function addParentOwned(
@@ -215,6 +243,13 @@ function addChildOwned(
     related.tables.root,
     targetColumns,
   );
+  if (isFilteredWrite(mutation)) {
+    if (relation.cardinality === '1:1') {
+      throw toOneRelation(name, mutation.kind);
+    }
+    addFilteredWrite(t, related, parent, fromParent, name, relation, mutation);
+    return;
+  }
   if (mutation.kind === 'create') {
     const keys = [{ from: parent, columns: fromParent }];
     const rows = mutation.data.map((row) => parseCreateInput(t, related, row));
@@ -301,6 +336,13 @@ function addJunctionOwned(
     junction.root,
     through.childColumns,
   );
+  if (isFilteredWrite(mutation)) {
+    throw ormError(
+      'ORM.RELATION_MUTATION_UNSUPPORTED',
+      `${mutation.kind}() nested mutation for relation "${name}" is not supported on a many-to-many relation yet`,
+      { meta: { kind: mutation.kind, relation: name, reason: 'many-to-many-relation' } },
+    );
+  }
   const addLink = (target: NodeId, conflict: InsertConflictSkip | undefined) => {
     const values = withCreateDefaults(context, through.namespaceId, through.table, {}, undefined);
     addInsert(t, junction.root, [values], {
@@ -346,6 +388,105 @@ function addJunctionOwned(
       ],
     });
   }
+}
+
+function addFilteredWrite(
+  t: Translation,
+  related: Model,
+  parent: NodeId,
+  fromParent: readonly ColumnMapping[],
+  name: string,
+  relation: ResolvedRelation,
+  mutation: FilteredWrite,
+): void {
+  const { context } = t;
+  const where = combineWhereExprs(
+    mutation.filters.flatMap((filter) => {
+      const expr = relatedFilter(context, related, filter);
+      return expr === undefined ? [] : [expr];
+    }),
+  );
+  const filters = [{ from: parent, columns: fromParent }];
+  if (mutation.kind === 'deleteAll') {
+    deleteRows(t, related.tables, { where, filters });
+    return;
+  }
+  const linking = relation.on.targetFields.filter((field) => Object.hasOwn(mutation.data, field));
+  if (linking.length > 0) {
+    throw ormError(
+      'ORM.RELATION_MUTATION_INVALID',
+      `updateAll() nested mutation for relation "${name}" cannot set ${linking.map((field) => `"${field}"`).join(', ')}, which links the related rows to their parent`,
+      {
+        meta: { kind: 'updateAll', relation: name, problem: 'parent-link-column', fields: linking },
+      },
+    );
+  }
+  const set = mapModelDataToStorageRow(
+    context.contract,
+    related.namespaceId,
+    related.modelName,
+    mutation.data,
+  );
+  if (Object.keys(set).length === 0) {
+    return;
+  }
+  updateRows(t, related, withRelatedUpdateDefaults(context, related, set), {
+    where,
+    filters,
+    payloads: [],
+    owner: { operation: 'updateAll', modelName: related.modelName },
+    returns: 'count',
+    shape: allColumns,
+    afterWrite: undefined,
+  });
+}
+
+function relatedFilter(
+  context: ExecutionContext,
+  related: Model,
+  filter: RelationMutationFilter<Contract<SqlStorage>, string>,
+): AnyExpression | undefined {
+  const { tables } = related;
+  const whereArg =
+    typeof filter === 'function'
+      ? whereArgOf(
+          filter(
+            createModelAccessor(context, related.namespaceId, related.modelName, tables),
+            createModelCallbackTools<Contract<SqlStorage>, string, never>(
+              context,
+              related.modelName,
+              tables,
+            ),
+          ),
+        )
+      : isWhereDirectInput(filter)
+        ? filter
+        : shorthandToWhereExpr(
+            context,
+            related.namespaceId,
+            related.modelName,
+            filter,
+            tables.root,
+          );
+  return normalizeWhereArg(whereArg, { contract: context.contract, tables: tableAliases(tables) });
+}
+
+function withRelatedUpdateDefaults(
+  context: ExecutionContext,
+  related: Model,
+  set: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const values: Record<string, unknown> = { ...set };
+  const { namespaceId, tableName } = related.tables.root.storage;
+  for (const applied of context.applyMutationDefaults({
+    op: 'update',
+    entry: tableName,
+    namespace: namespaceId,
+    values,
+  })) {
+    values[applied.field] = applied.value;
+  }
+  return values;
 }
 
 function addChildInserts(
